@@ -51,6 +51,15 @@ KHASH_SET_INIT_INT64(64)
 
 typedef kh_reg_t reghash_t;
 
+static void reglist_grow(reglist_t *r)
+{
+	if (r->n == r->m) {
+		r->m = r->m? r->m<<1 : 4;
+		r->a = (uint64_t*)realloc(r->a, r->m * 16);
+		r->rev = (int8_t*)realloc(r->rev, r->m);
+	}
+}
+
 reghash_t *stk_reg_read_alt(const char *fn)
 {
 	reghash_t *h = kh_init(reg);
@@ -97,11 +106,7 @@ reghash_t *stk_reg_read_alt(const char *fn)
 		r = &kh_val(h, k);
 		if (end < 0 && beg > 0) end = beg, beg = beg - 1; // if there is only one column
 		if (beg < 0) beg = 0, end = INT64_MAX;
-		if (r->n == r->m) {
-			r->m = r->m? r->m<<1 : 4;
-			r->a = (uint64_t*)realloc(r->a, r->m * 16);
-			r->rev = (int8_t*)realloc(r->rev, r->m);
-		}
+		reglist_grow(r);
 		r->a[r->n<<1] = (uint64_t)beg;
 		r->a[r->n<<1|1] = (uint64_t)end;
 		r->rev[r->n++] = rev;
@@ -150,10 +155,7 @@ reghash_t *stk_reg_read(const char *fn)
 		if (dret != '\n') while ((dret = ks_getc(ks)) > 0 && dret != '\n');
 		if (end < 0 && beg > 0) end = beg, beg = beg - 1; // if there is only one column
 		if (beg < 0) beg = 0, end = INT64_MAX;
-		if (p->n == p->m) {
-			p->m = p->m? p->m<<1 : 4;
-			p->a = realloc(p->a, p->m * 16);
-		}
+		reglist_grow(p);
 		p->a[p->n<<1] = (uint64_t)beg;
 		p->a[p->n<<1|1] = (uint64_t)end;
 		p->n++;
@@ -251,24 +253,7 @@ static void stk_printstr(FILE *fp, const kstring_t *s, unsigned line_len)
 	}
 }
 
-static inline void stk_printseq_renamed(FILE *fp, const kseq_t *s, int line_len, const char *prefix, int64_t n)
-{
-	fputc(s->qual.l? '@' : '>', fp);
-	if (n >= 0) {
-		if (prefix) fputs(prefix, fp);
-		fprintf(fp, "%lld", (long long)n);
-	} else fputs(s->name.s, fp);
-	if (s->comment.l) {
-		fputc(' ', fp); fputs(s->comment.s, fp);
-	}
-	stk_printstr(fp, &s->seq, line_len);
-	if (s->qual.l) {
-		fputc('+', fp);
-		stk_printstr(fp, &s->qual, line_len);
-	}
-}
-
-static inline void stk_printseq_suffix(FILE *fp, const kseq_t *s, int line_len, const char *suffix)
+static void stk_print_header(FILE *fp, const kseq_t *s, const char *suffix)
 {
 	fputc(s->qual.l? '@' : '>', fp);
 	fputs(s->name.s, fp);
@@ -276,11 +261,34 @@ static inline void stk_printseq_suffix(FILE *fp, const kseq_t *s, int line_len, 
 	if (s->comment.l) {
 		fputc(' ', fp); fputs(s->comment.s, fp);
 	}
+}
+
+static void stk_print_body(FILE *fp, const kseq_t *s, unsigned line_len)
+{
 	stk_printstr(fp, &s->seq, line_len);
 	if (s->qual.l) {
 		fputc('+', fp);
 		stk_printstr(fp, &s->qual, line_len);
 	}
+}
+
+static inline void stk_printseq_renamed(FILE *fp, const kseq_t *s, int line_len, const char *prefix, int64_t n)
+{
+	if (n >= 0) {
+		fputc(s->qual.l? '@' : '>', fp);
+		if (prefix) fputs(prefix, fp);
+		fprintf(fp, "%lld", (long long)n);
+		if (s->comment.l) {
+			fputc(' ', fp); fputs(s->comment.s, fp);
+		}
+	} else stk_print_header(fp, s, 0);
+	stk_print_body(fp, s, line_len);
+}
+
+static inline void stk_printseq_suffix(FILE *fp, const kseq_t *s, int line_len, const char *suffix)
+{
+	stk_print_header(fp, s, suffix);
+	stk_print_body(fp, s, line_len);
 }
 
 static inline void stk_printseq(FILE *fp, const kseq_t *s, int line_len)
@@ -358,20 +366,36 @@ krint64_t kr_rand(krand_t *kr)
 
 
 /* quality based trimming with Mott's algorithm */
+static void stk_synth_qual(kseq_t *seq, int64_t beg, int64_t end, int qual_chr)
+{ // fill the retained window [beg, end) with a uniform quality value
+	int64_t n = end - beg;
+	if (n <= 0) return;
+	if (seq->qual.m < (uint64_t)n + 1) {
+		seq->qual.m = n + 1;
+		kroundup64(seq->qual.m);
+		seq->qual.s = (char*)realloc(seq->qual.s, seq->qual.m);
+	}
+	memset(seq->qual.s, qual_chr, n);
+	seq->qual.s[n] = 0;
+	seq->qual.l = n;
+	seq->is_fastq = 1;
+}
+
 int stk_trimfq(int argc, char *argv[])
 { // FIXME: when a record with zero length will always be treated as a fasta record
 	gzFile fp;
 	kseq_t *seq;
 	double param = 0.05, q_int2real[128];
-	int c, min_len = 30, left = 0, right = 0, fixed_len = -1;
+	int c, min_len = 30, left = 0, right = 0, fixed_len = -1, force_fastq = 0;
 	int64_t i;
-	while ((c = getopt(argc, argv, "l:q:b:e:L:")) >= 0) {
+	while ((c = getopt(argc, argv, "l:q:b:e:L:Q")) >= 0) {
 		switch (c) {
 			case 'q': param = atof(optarg); break;
 			case 'l': min_len = atoi(optarg); break;
 			case 'b': left = atoi(optarg); break;
 			case 'e': right = atoi(optarg); break;
 			case 'L': fixed_len = atoi(optarg); break;
+			case 'Q': force_fastq = 1; break;
 		}
 	}
 	if (optind == argc) {
@@ -425,6 +449,8 @@ int stk_trimfq(int argc, char *argv[])
 				end = beg + min_len;
 			}
 		} else beg = 0, end = seq->seq.l;
+		if (force_fastq && !seq->is_fastq) // option -Q: synthesize qualities over the retained window
+			stk_synth_qual(seq, beg, end, 'I');
 		putchar(seq->is_fastq? '@' : '>'); fputs(seq->name.s, stdout); 
 		if (seq->comment.l) {
 			putchar(' '); puts(seq->comment.s);
@@ -951,10 +977,7 @@ int stk_mutfa(int argc, char *argv[])
 		// skip the rest of the line
 		if (dret != '\n') while ((dret = ks_getc(ks)) > 0 && dret != '\n');
 		if (isalpha(str->s[0]) && str->l == 1) {
-			if (p->n == p->m) {
-				p->m = p->m? p->m<<1 : 4;
-				p->a = realloc(p->a, p->m * 16);
-			}
+			reglist_grow(p);
 			p->a[p->n<<1] = (uint64_t)beg;
 			p->a[p->n<<1|1] = (uint64_t)str->s[0];
 			p->n++;
@@ -991,13 +1014,7 @@ int stk_mutfa(int argc, char *argv[])
 	// free
 	kseq_destroy(seq);
 	gzclose(fp);
-	for (k = 0; k < kh_end(h); ++k) {
-		if (kh_exist(h, k)) {
-			free(kh_val(h, k).a);
-			free((char*)kh_key(h, k));
-		}
-	}
-	kh_destroy(reg, h);
+	stk_reg_destroy(h);
 	return 0;
 }
 
@@ -1223,6 +1240,13 @@ static void cpy_kseq(kseq_t *dst, const kseq_t *src)
 	cpy_kstr(&dst->seq,  &src->seq);
 	cpy_kstr(&dst->qual, &src->qual);
 	cpy_kstr(&dst->comment, &src->comment);
+}
+
+static void stk_kseq_release(kseq_t *ks)
+{
+	free(ks->name.s); free(ks->comment.s);
+	free(ks->seq.s); free(ks->qual.s);
+	memset(ks, 0, sizeof(kseq_t));
 }
 
 int stk_sample(int argc, char *argv[])
@@ -1669,7 +1693,7 @@ int stk_dropse(int argc, char *argv[])
 
 	kseq_destroy(seq);
 	gzclose(fp);
-	// free last!
+	stk_kseq_release(&last);
 	return 0;
 }
 
@@ -1770,7 +1794,7 @@ int stk_rename(int argc, char *argv[])
 
 	kseq_destroy(seq);
 	gzclose(fp);
-	// free last!
+	stk_kseq_release(&last);
 	return 0;
 }
 
