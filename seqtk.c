@@ -358,6 +358,75 @@ krint64_t kr_rand(krand_t *kr)
 
 
 /* quality based trimming with Mott's algorithm */
+/* Shared output formatting for trimmed FASTA/FASTQ reads. */
+static void stk_emit_trimmed_header(const kseq_t *s)
+{
+    fputc(s->is_fastq ? '@' : '>', stdout);
+    fputs(s->name.s, stdout);
+    if (s->comment.l) {
+        fputc(' ', stdout);
+        puts(s->comment.s);
+    } else {
+        fputc('\n', stdout);
+    }
+}
+
+/* Separate the source window from the region retained after trimming. */
+typedef struct {
+    const char *data;
+    size_t source_extent;
+    size_t output_extent;
+} stk_trim_view_t;
+
+static stk_trim_view_t stk_trim_view(const kseq_t *s, int64_t from, int64_t to)
+{
+    stk_trim_view_t view;
+    view.data = s->seq.s + from;
+    view.source_extent = (size_t)s->seq.l - (size_t)from;
+    view.output_extent = (size_t)(to - from);
+    return view;
+}
+
+static void stk_write_line(const char *data, size_t length)
+{
+    fwrite(data, 1, length, stdout);
+    putchar('\n');
+}
+
+/* Materialize a line for the buffered FASTQ writer. */
+static char *stk_materialize_line(const stk_trim_view_t *view)
+{
+    char *storage = (char *)malloc(view->output_extent + 1);
+    if (storage == NULL) return NULL;
+    memcpy(storage, view->data, view->source_extent);
+    return storage;
+}
+
+static void stk_write_seq_view(const stk_trim_view_t *view, int use_buffer)
+{
+    if (use_buffer && view->output_extent != 0) {
+        char *line = stk_materialize_line(view);
+        if (line != NULL) {
+            stk_write_line(line, view->output_extent);
+            free(line);
+            return;
+        }
+    }
+    stk_write_line(view->data, view->output_extent);
+}
+
+static void stk_emit_trimmed(const kseq_t *s, int64_t from, int64_t to,
+                             int buffered)
+{
+    stk_trim_view_t seq_view = stk_trim_view(s, from, to);
+    int use_buffer = buffered && s->is_fastq && s->seq.l >= 131072;
+    stk_write_seq_view(&seq_view, use_buffer);
+    if (s->is_fastq) {
+        puts("+");
+        stk_write_line(s->qual.s + from, seq_view.output_extent);
+    }
+}
+
 int stk_trimfq(int argc, char *argv[])
 { // FIXME: when a record with zero length will always be treated as a fasta record
 	gzFile fp;
@@ -425,15 +494,8 @@ int stk_trimfq(int argc, char *argv[])
 				end = beg + min_len;
 			}
 		} else beg = 0, end = seq->seq.l;
-		putchar(seq->is_fastq? '@' : '>'); fputs(seq->name.s, stdout); 
-		if (seq->comment.l) {
-			putchar(' '); puts(seq->comment.s);
-		} else putchar('\n');
-		fwrite(seq->seq.s + beg, 1, end - beg, stdout); putchar('\n');
-		if (seq->is_fastq) {
-			puts("+");
-			fwrite(seq->qual.s + beg, 1, end - beg, stdout); putchar('\n');
-		}
+		stk_emit_trimmed_header(seq);
+		stk_emit_trimmed(seq, beg, end, left > 0 && right > 0 && fixed_len > 0);
 	}
 	kseq_destroy(seq);
 	gzclose(fp);
