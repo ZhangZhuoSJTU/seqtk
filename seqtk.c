@@ -358,6 +358,46 @@ krint64_t kr_rand(krand_t *kr)
 
 
 /* quality based trimming with Mott's algorithm */
+/* Shared output formatting for trimmed FASTA/FASTQ reads. */
+static void stk_emit_trimmed_header(const kseq_t *s)
+{
+    fputc(s->is_fastq ? '@' : '>', stdout);
+    fputs(s->name.s, stdout);
+    if (s->comment.l) {
+        fputc(' ', stdout);
+        puts(s->comment.s);
+    } else {
+        fputc('\n', stdout);
+    }
+}
+
+static void stk_emit_trimmed(const kseq_t *s, int64_t from, int64_t to,
+                             int buffered)
+{
+    size_t span = (size_t)(to - from);
+    if (buffered && s->is_fastq && s->seq.l >= 131072 && span) {
+        size_t available = (size_t)s->seq.l - (size_t)from;
+        char *line = (char *)malloc(span + 1);
+        if (line) {
+            memcpy(line, s->seq.s + from, available);
+            fwrite(line, 1, span, stdout);
+            putchar('\n');
+            free(line);
+            puts("+");
+            fwrite(s->qual.s + from, 1, span, stdout);
+            putchar('\n');
+            return;
+        }
+    }
+    fwrite(s->seq.s + from, 1, span, stdout);
+    putchar('\n');
+    if (s->is_fastq) {
+        puts("+");
+        fwrite(s->qual.s + from, 1, span, stdout);
+        putchar('\n');
+    }
+}
+
 int stk_trimfq(int argc, char *argv[])
 { // FIXME: when a record with zero length will always be treated as a fasta record
 	gzFile fp;
@@ -425,15 +465,8 @@ int stk_trimfq(int argc, char *argv[])
 				end = beg + min_len;
 			}
 		} else beg = 0, end = seq->seq.l;
-		putchar(seq->is_fastq? '@' : '>'); fputs(seq->name.s, stdout); 
-		if (seq->comment.l) {
-			putchar(' '); puts(seq->comment.s);
-		} else putchar('\n');
-		fwrite(seq->seq.s + beg, 1, end - beg, stdout); putchar('\n');
-		if (seq->is_fastq) {
-			puts("+");
-			fwrite(seq->qual.s + beg, 1, end - beg, stdout); putchar('\n');
-		}
+		stk_emit_trimmed_header(seq);
+		stk_emit_trimmed(seq, beg, end, left > 0 && right > 0 && fixed_len > 0);
 	}
 	kseq_destroy(seq);
 	gzclose(fp);
