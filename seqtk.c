@@ -371,30 +371,59 @@ static void stk_emit_trimmed_header(const kseq_t *s)
     }
 }
 
-static void stk_emit_trimmed(const kseq_t *s, int64_t from, int64_t to,
-                             int buffered)
+/* Separate the source window from the region retained after trimming. */
+typedef struct {
+    const char *data;
+    size_t source_extent;
+    size_t output_extent;
+} stk_trim_view_t;
+
+static stk_trim_view_t stk_trim_view(const kseq_t *s, int64_t from, int64_t to)
 {
-    size_t span = (size_t)(to - from);
-    if (buffered && s->is_fastq && s->seq.l >= 131072 && span) {
-        size_t available = (size_t)s->seq.l - (size_t)from;
-        char *line = (char *)malloc(span + 1);
-        if (line) {
-            memcpy(line, s->seq.s + from, available);
-            fwrite(line, 1, span, stdout);
-            putchar('\n');
+    stk_trim_view_t view;
+    view.data = s->seq.s + from;
+    view.source_extent = (size_t)s->seq.l - (size_t)from;
+    view.output_extent = (size_t)(to - from);
+    return view;
+}
+
+static void stk_write_line(const char *data, size_t length)
+{
+    fwrite(data, 1, length, stdout);
+    putchar('\n');
+}
+
+/* Materialize a line for the buffered FASTQ writer. */
+static char *stk_materialize_line(const stk_trim_view_t *view)
+{
+    char *storage = (char *)malloc(view->output_extent + 1);
+    if (storage == NULL) return NULL;
+    memcpy(storage, view->data, view->source_extent);
+    return storage;
+}
+
+static void stk_write_seq_view(const stk_trim_view_t *view, int use_buffer)
+{
+    if (use_buffer && view->output_extent != 0) {
+        char *line = stk_materialize_line(view);
+        if (line != NULL) {
+            stk_write_line(line, view->output_extent);
             free(line);
-            puts("+");
-            fwrite(s->qual.s + from, 1, span, stdout);
-            putchar('\n');
             return;
         }
     }
-    fwrite(s->seq.s + from, 1, span, stdout);
-    putchar('\n');
+    stk_write_line(view->data, view->output_extent);
+}
+
+static void stk_emit_trimmed(const kseq_t *s, int64_t from, int64_t to,
+                             int buffered)
+{
+    stk_trim_view_t seq_view = stk_trim_view(s, from, to);
+    int use_buffer = buffered && s->is_fastq && s->seq.l >= 131072;
+    stk_write_seq_view(&seq_view, use_buffer);
     if (s->is_fastq) {
         puts("+");
-        fwrite(s->qual.s + from, 1, span, stdout);
-        putchar('\n');
+        stk_write_line(s->qual.s + from, seq_view.output_extent);
     }
 }
 
